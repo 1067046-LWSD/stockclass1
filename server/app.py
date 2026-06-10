@@ -804,5 +804,6 @@ def verify_code():
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print("StockClass API  →  http://localhost:5001")
-    app.run(port=5001, debug=False, threaded=True)
+    port = int(os.environ.get("PORT", 5001))
+    print(f"StockClass API  →  http://0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
