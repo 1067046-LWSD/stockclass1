@@ -43,20 +43,18 @@ export async function refreshPrices(tickers) {
   return apiFetch(`${BASE}/refresh?tickers=${tickers.map(encodeURIComponent).join(",")}`);
 }
 
-// Send a 6-digit verification code to the given email address.
-export async function sendVerificationCode(email) {
-  return apiFetch(`${BASE}/auth/send-code`, {
+export async function registerUser(name, email, password, role) {
+  return apiFetch(`${BASE}/auth/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email }),
+    body: JSON.stringify({ name, email, password, role }),
   });
 }
 
-// Verify the 6-digit code sent to email.
-export async function verifyCode(email, code) {
-  return apiFetch(`${BASE}/auth/verify-code`, {
+export async function loginUser(email, password) {
+  return apiFetch(`${BASE}/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, code }),
+    body: JSON.stringify({ email, password }),
   });
 }

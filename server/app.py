@@ -34,14 +34,38 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-import resend
+import sqlite3
+
 import yfinance as yf
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
 
-# Resend is configured via environment variable RESEND_API_KEY.
-# RESEND_FROM must also be set to a verified sender address/domain.
-resend.api_key = os.environ.get("RESEND_API_KEY", "")
+# SQLite user store — persists across restarts when a volume is mounted.
+# Set DB_PATH=/data/users.db in Railway (with a /data volume) for persistence.
+_DB_PATH = os.environ.get("DB_PATH", "./users.db")
+
+
+def _get_db():
+    conn = sqlite3.connect(_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db():
+    with _get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id       TEXT PRIMARY KEY,
+                name     TEXT NOT NULL,
+                email    TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL,
+                role     TEXT NOT NULL DEFAULT 'student'
+            )
+        """)
+
+
+_init_db()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -685,120 +709,53 @@ def refresh():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7. AUTH — EMAIL VERIFICATION
+# 7. AUTH — REGISTER / LOGIN
 # ══════════════════════════════════════════════════════════════════════════════
 
-# email → { "code": str, "expires": float }
-_pending_codes: dict[str, dict] = {}
-_codes_lock = threading.Lock()
-CODE_TTL = 600  # 10 minutes
+@app.route("/auth/register", methods=["POST"])
+def auth_register():
+    body     = request.get_json(silent=True) or {}
+    name     = (body.get("name") or "").strip()
+    email    = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
+    role     = body.get("role") or "student"
 
-RESEND_FROM = os.environ.get("RESEND_FROM", "StockRoom <onboarding@resend.dev>")
+    if not name or not email or not password:
+        return jsonify({"error": "Name, email, and password are required"}), 400
+    if "@" not in email:
+        return jsonify({"error": "Invalid email address"}), 400
 
-
-def _purge_expired() -> None:
-    """Remove stale entries (called on every write to keep the dict tidy)."""
-    now = time.time()
-    expired = [e for e, v in _pending_codes.items() if v["expires"] < now]
-    for e in expired:
-        del _pending_codes[e]
-
-
-@app.route("/auth/send-code", methods=["POST"])
-def send_code():
-    """
-    POST /auth/send-code
-    Body: { "email": "..." }
-
-    Generates a 6-digit verification code, stores it for 10 minutes,
-    and sends it to the given address via Resend.
-
-    Response: { "ok": true }
-    Errors:   { "error": "..." } with 400 or 502
-    """
-    body  = request.get_json(silent=True) or {}
-    email = (body.get("email") or "").strip().lower()
-
-    if not email or "@" not in email:
-        return jsonify({"error": "A valid email address is required"}), 400
-
-    if not resend.api_key:
-        return jsonify({"error": "Email service not configured on the server"}), 502
-
-    code = f"{secrets.randbelow(1_000_000):06d}"
-
-    with _codes_lock:
-        _purge_expired()
-        _pending_codes[email] = {"code": code, "expires": time.time() + CODE_TTL}
-
-    html_body = f"""
-    <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
-      <h2 style="color: #1a1a2e; margin-bottom: 8px;">Verify your StockRoom account</h2>
-      <p style="color: #555; margin-bottom: 24px;">
-        Enter the code below to complete your sign-up. It expires in 10 minutes.
-      </p>
-      <div style="
-        font-family: monospace; font-size: 36px; font-weight: 700;
-        letter-spacing: 0.25em; color: #1a1a2e;
-        background: #f4f4f8; border-radius: 12px;
-        padding: 20px 32px; text-align: center;
-        margin-bottom: 24px;
-      ">{code}</div>
-      <p style="color: #999; font-size: 13px;">
-        If you didn't request this, you can safely ignore this email.
-      </p>
-    </div>
-    """
+    uid = "u" + secrets.token_hex(8)
+    pw_hash = generate_password_hash(password)
 
     try:
-        resend.Emails.send({
-            "from":    RESEND_FROM,
-            "to":      [email],
-            "subject": f"Your StockRoom verification code: {code}",
-            "html":    html_body,
-        })
-    except Exception as exc:
-        return jsonify({"error": f"Failed to send email: {exc}"}), 502
+        with _get_db() as conn:
+            conn.execute(
+                "INSERT INTO users (id, name, email, password, role) VALUES (?, ?, ?, ?, ?)",
+                (uid, name, email, pw_hash, role),
+            )
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Email already registered"}), 409
 
-    return jsonify({"ok": True})
+    return jsonify({"id": uid, "name": name, "email": email, "role": role})
 
 
-@app.route("/auth/verify-code", methods=["POST"])
-def verify_code():
-    """
-    POST /auth/verify-code
-    Body: { "email": "...", "code": "..." }
+@app.route("/auth/login", methods=["POST"])
+def auth_login():
+    body     = request.get_json(silent=True) or {}
+    email    = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
 
-    Checks the code against the pending store.  On success the entry is
-    deleted (single-use).
+    if not email or not password:
+        return jsonify({"error": "Email and password are required"}), 400
 
-    Response: { "ok": true }
-    Errors:   { "error": "..." } with 400
-    """
-    body  = request.get_json(silent=True) or {}
-    email = (body.get("email") or "").strip().lower()
-    code  = str(body.get("code") or "").strip()
+    with _get_db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
 
-    if not email or not code:
-        return jsonify({"error": "Email and code are required"}), 400
+    if not row or not check_password_hash(row["password"], password):
+        return jsonify({"error": "Invalid email or password"}), 401
 
-    with _codes_lock:
-        entry = _pending_codes.get(email)
-
-        if not entry:
-            return jsonify({"error": "No verification code found for this email. Please request a new one."}), 400
-
-        if time.time() > entry["expires"]:
-            del _pending_codes[email]
-            return jsonify({"error": "Code has expired. Please request a new one."}), 400
-
-        if not secrets.compare_digest(entry["code"], code):
-            return jsonify({"error": "Incorrect code. Please try again."}), 400
-
-        # Valid — consume the code
-        del _pending_codes[email]
-
-    return jsonify({"ok": True})
+    return jsonify({"id": row["id"], "name": row["name"], "email": row["email"], "role": row["role"]})
 
 
 # ══════════════════════════════════════════════════════════════════════════════

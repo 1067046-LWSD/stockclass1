@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
-import { searchTicker as searchTickerApi, getQuote, getHistory, refreshPrices, searchCompanies as searchCompaniesApi, sendVerificationCode as sendVerificationCodeApi, verifyCode as verifyCodeApi } from "./api";
+import { searchTicker as searchTickerApi, getQuote, getHistory, refreshPrices, searchCompanies as searchCompaniesApi, registerUser, loginUser } from "./api";
 
 // ─── CONSTANTS & HELPERS ──────────────────────────────────────────────────────
 const fmt$ = (n) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2 }).format(n);
@@ -761,9 +761,16 @@ export default function App() {
     }));
   };
 
-  const handleLogin = (forceOverride = false) => {
-    const user = users.find(u => u.email.toLowerCase() === authForm.email.trim().toLowerCase() && u.password === authForm.password);
-    if (!user) { notify("Invalid email or password", "error"); return; }
+  const handleLogin = async (forceOverride = false) => {
+    let user;
+    try {
+      user = await loginUser(authForm.email.trim().toLowerCase(), authForm.password);
+    } catch (err) {
+      notify(err.message || "Invalid email or password", "error"); return;
+    }
+
+    // Keep local users list in sync so class-assignment lookups work
+    setUsers(prev => prev.some(u => u.id === user.id) ? prev : [...prev, user]);
 
     // Single-session enforcement
     const activeTs = localStorage.getItem('sc_active_' + user.email);
@@ -792,12 +799,18 @@ export default function App() {
     }
   };
 
-  const handleSignup = () => {
+  const handleSignup = async () => {
     if (!authForm.name || !authForm.email || !authForm.password) { notify("Fill all fields", "error"); return; }
     if (authForm.role === "student" && !authForm.classCode) { notify("Enter a class code", "error"); return; }
     const emailNorm = authForm.email.trim().toLowerCase();
-    if (users.find(u => u.email.toLowerCase() === emailNorm)) { notify("Email already registered", "error"); return; }
-    const newUser = { id: "u" + Date.now(), name: authForm.name, email: emailNorm, password: authForm.password, role: authForm.role };
+
+    let newUser;
+    try {
+      newUser = await registerUser(authForm.name.trim(), emailNorm, authForm.password, authForm.role);
+    } catch (err) {
+      notify(err.message || "Registration failed", "error"); return;
+    }
+
     setUsers(prev => [...prev, newUser]);
     if (authForm.role === "student") {
       const cls = classes.find(c => c.code === authForm.classCode.toUpperCase());
@@ -1037,66 +1050,32 @@ function AuthScreen({ authTab, setAuthTab, authForm, setAuthForm, handleLogin, h
   const [fpConfirm, setFpConfirm] = useState("");
   const [fpError, setFpError] = useState("");
 
-  // Email verification signup flow
-  const [signupStep, setSignupStep] = useState("form"); // "form" | "verify" | "done"
-  const [enteredCode, setEnteredCode] = useState("");
-  const [sendLoading, setSendLoading] = useState(false);
-  const [verifyLoading, setVerifyLoading] = useState(false);
-  const [verifyError, setVerifyError] = useState("");
-  const [resendCooldown, setResendCooldown] = useState(0);
-  const cooldownRef = useRef(null);
+  const [signupLoading, setSignupLoading] = useState(false);
+  const [signupError, setSignupError] = useState("");
 
   const switchTab = (t) => {
     setAuthTab(t);
     setSessionConflict(null);
     setFpStep(0); setFpEmail(""); setFpPassword(""); setFpConfirm(""); setFpError("");
-    setSignupStep("form"); setEnteredCode(""); setVerifyError("");
-    setSendLoading(false); setVerifyLoading(false);
+    setSignupError("");
   };
 
-  const startResendCooldown = () => {
-    setResendCooldown(60);
-    clearInterval(cooldownRef.current);
-    cooldownRef.current = setInterval(() => {
-      setResendCooldown(prev => {
-        if (prev <= 1) { clearInterval(cooldownRef.current); return 0; }
-        return prev - 1;
-      });
-    }, 1000);
-  };
-
-  const initiateSignup = async () => {
+  const doSignup = async () => {
     if (!authForm.name.trim() || !authForm.email.trim() || !authForm.password) {
-      setVerifyError("Please fill in all fields"); return;
+      setSignupError("Please fill in all fields"); return;
     }
     if (authForm.role === "student" && !authForm.classCode.trim()) {
-      setVerifyError("Enter a class access code"); return;
+      setSignupError("Enter a class access code"); return;
     }
     const { score } = getPasswordStrength(authForm.password);
-    if (score < 5) { setVerifyError("Your password doesn't meet all requirements"); return; }
-    setSendLoading(true); setVerifyError("");
+    if (score < 5) { setSignupError("Your password doesn't meet all requirements"); return; }
+    setSignupLoading(true); setSignupError("");
     try {
-      await sendVerificationCodeApi(authForm.email.trim().toLowerCase());
-      setSignupStep("verify");
-      startResendCooldown();
+      await handleSignup();
     } catch (err) {
-      setVerifyError(err.message || "Failed to send verification email. Is the server running?");
+      setSignupError(err.message || "Registration failed. Is the server running?");
     } finally {
-      setSendLoading(false);
-    }
-  };
-
-  const submitVerification = async () => {
-    if (!enteredCode.trim()) { setVerifyError("Enter the 6-digit code"); return; }
-    setVerifyLoading(true); setVerifyError("");
-    try {
-      await verifyCodeApi(authForm.email.trim().toLowerCase(), enteredCode.trim());
-      setSignupStep("done");
-      setTimeout(() => handleSignup(), 1500);
-    } catch (err) {
-      setVerifyError(err.message || "Incorrect or expired code");
-    } finally {
-      setVerifyLoading(false);
+      setSignupLoading(false);
     }
   };
 
@@ -1229,8 +1208,8 @@ function AuthScreen({ authTab, setAuthTab, authForm, setAuthForm, handleLogin, h
         {/* ── LOGIN / SIGNUP TABS ── */}
         {authTab !== "forgot" && (
           <>
-            {/* Tab switcher — hidden during email verification steps */}
-            {!(authTab === "signup" && signupStep !== "form") && (
+            {/* Tab switcher */}
+            {(
               <div style={{
                 display: "flex", background: "rgba(255,255,255,0.04)",
                 borderRadius: 10, padding: 3, marginBottom: 22,
@@ -1251,181 +1230,103 @@ function AuthScreen({ authTab, setAuthTab, authForm, setAuthForm, handleLogin, h
               </div>
             )}
 
-            {/* ── VERIFY STEP ── */}
-            {authTab === "signup" && signupStep === "verify" && (
-              <div className="sc-anim">
-                <button onClick={() => setSignupStep("form")} style={{
-                  background: "none", border: "none", cursor: "pointer",
-                  color: "rgba(238,238,242,0.45)", fontSize: 13, marginBottom: 20,
-                  fontFamily: "DM Sans, sans-serif", padding: 0, display: "flex", alignItems: "center", gap: 6,
-                }}>← Back</button>
-                <div style={{ textAlign: "center", marginBottom: 24 }}>
-                  <div style={{
-                    width: 52, height: 52, borderRadius: "50%",
-                    background: "rgba(91,120,255,0.15)", border: "1px solid rgba(91,120,255,0.3)",
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    margin: "0 auto 14px", fontSize: 22,
-                  }}>✉</div>
-                  <h3 style={{ fontFamily: "Syne, sans-serif", fontWeight: 700, fontSize: 18, marginBottom: 6 }}>Check your inbox</h3>
-                  <p style={{ fontSize: 13, color: "rgba(238,238,242,0.45)", lineHeight: 1.6 }}>
-                    We sent a 6-digit code to<br />
-                    <strong style={{ color: "#eeeef2" }}>{authForm.email}</strong>
-                  </p>
-                </div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  <input
-                    type="text" inputMode="numeric" maxLength={6}
-                    placeholder="000000"
-                    value={enteredCode}
-                    onChange={e => { setEnteredCode(e.target.value.replace(/\D/g, "").slice(0, 6)); setVerifyError(""); }}
-                    onKeyDown={e => e.key === "Enter" && submitVerification()}
-                    style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 28, fontWeight: 700, textAlign: "center", letterSpacing: "0.3em", padding: "14px" }}
-                  />
-                  {verifyError && (
-                    <div style={{ fontSize: 12, color: "#ff3b5c", padding: "7px 10px", background: "rgba(255,59,92,0.08)", borderRadius: 7, border: "1px solid rgba(255,59,92,0.2)" }}>
-                      {verifyError}
-                    </div>
-                  )}
-                  <button onClick={submitVerification} disabled={verifyLoading || enteredCode.length < 6} style={{
-                    ...btnStyle("green"),
-                    opacity: (verifyLoading || enteredCode.length < 6) ? 0.55 : 1,
-                    cursor: (verifyLoading || enteredCode.length < 6) ? "default" : "pointer",
-                  }}>
-                    {verifyLoading ? "Verifying…" : "Verify email"}
-                  </button>
-                  <div style={{ textAlign: "center", marginTop: 4 }}>
-                    {resendCooldown > 0 ? (
-                      <span style={{ fontSize: 12, color: "rgba(238,238,242,0.35)" }}>
-                        Resend code in {resendCooldown}s
-                      </span>
-                    ) : (
-                      <button onClick={initiateSignup} disabled={sendLoading} style={{
-                        background: "none", border: "none", cursor: "pointer",
-                        fontSize: 13, color: "#7b96ff", fontFamily: "DM Sans, sans-serif",
-                      }}>
-                        {sendLoading ? "Sending…" : "Resend code"}
-                      </button>
-                    )}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* ── DONE STEP ── */}
-            {authTab === "signup" && signupStep === "done" && (
-              <div className="sc-anim" style={{ textAlign: "center", padding: "12px 0" }}>
+            {/* ── FORM (login or signup) ── */}
+            <>
+              {/* Session conflict warning */}
+              {sessionConflict && (
                 <div style={{
-                  width: 56, height: 56, borderRadius: "50%",
-                  background: "rgba(0,192,118,0.15)", border: "2px solid rgba(0,192,118,0.35)",
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                  margin: "0 auto 16px", fontSize: 24, color: "#00c076",
-                }}>✓</div>
-                <h3 style={{ fontFamily: "Syne, sans-serif", fontWeight: 700, fontSize: 18, marginBottom: 8 }}>Email verified!</h3>
-                <p style={{ fontSize: 13, color: "rgba(238,238,242,0.45)" }}>Setting up your account…</p>
-              </div>
-            )}
+                  marginBottom: 16, padding: "12px 14px",
+                  background: "rgba(240,180,41,0.08)", border: "1px solid rgba(240,180,41,0.25)",
+                  borderRadius: 10, fontSize: 13,
+                }}>
+                  <div style={{ fontWeight: 600, color: "#f0b429", marginBottom: 6 }}>Already logged in</div>
+                  <div style={{ color: "rgba(238,238,242,0.55)", marginBottom: 10 }}>
+                    This account is already active in another session. Continue to end that session and log in here.
+                  </div>
+                  <button onClick={() => handleLogin(true)} style={{
+                    width: "100%", padding: "8px",
+                    background: "rgba(240,180,41,0.15)", border: "1px solid rgba(240,180,41,0.3)",
+                    borderRadius: 8, cursor: "pointer", fontSize: 13, fontWeight: 600,
+                    color: "#f0b429", fontFamily: "DM Sans, sans-serif",
+                  }}>Continue &amp; end other session</button>
+                </div>
+              )}
 
-            {/* ── FORM STEP (login or signup step="form") ── */}
-            {!(authTab === "signup" && signupStep !== "form") && (
-              <>
-                {/* Session conflict warning */}
-                {sessionConflict && (
-                  <div style={{
-                    marginBottom: 16, padding: "12px 14px",
-                    background: "rgba(240,180,41,0.08)", border: "1px solid rgba(240,180,41,0.25)",
-                    borderRadius: 10, fontSize: 13,
-                  }}>
-                    <div style={{ fontWeight: 600, color: "#f0b429", marginBottom: 6 }}>Already logged in</div>
-                    <div style={{ color: "rgba(238,238,242,0.55)", marginBottom: 10 }}>
-                      This account is already active in another session. Continue to end that session and log in here.
-                    </div>
-                    <button onClick={() => handleLogin(true)} style={{
-                      width: "100%", padding: "8px",
-                      background: "rgba(240,180,41,0.15)", border: "1px solid rgba(240,180,41,0.3)",
-                      borderRadius: 8, cursor: "pointer", fontSize: 13, fontWeight: 600,
-                      color: "#f0b429", fontFamily: "DM Sans, sans-serif",
-                    }}>Continue &amp; end other session</button>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {authTab === "signup" && (
+                  <>
+                    <input placeholder="Full name" value={authForm.name}
+                      onChange={e => setAuthForm(p => ({ ...p, name: e.target.value }))} />
+                    <select value={authForm.role} onChange={e => setAuthForm(p => ({ ...p, role: e.target.value }))}>
+                      <option value="student">Student</option>
+                      <option value="teacher">Teacher</option>
+                    </select>
+                    {authForm.role === "student" && (
+                      <input placeholder="Class access code"
+                        value={authForm.classCode}
+                        onChange={e => setAuthForm(p => ({ ...p, classCode: e.target.value }))}
+                        style={{ fontFamily: "'IBM Plex Mono',monospace", letterSpacing: "0.12em", textTransform: "uppercase" }} />
+                    )}
+                  </>
+                )}
+                <input type="email" placeholder="Email address" value={authForm.email}
+                  onChange={e => { setAuthForm(p => ({ ...p, email: e.target.value })); setSessionConflict(null); }} />
+                <div>
+                  <input type="password" placeholder="Password" value={authForm.password}
+                    onChange={e => { setAuthForm(p => ({ ...p, password: e.target.value })); setSessionConflict(null); setSignupError(""); }}
+                    onKeyDown={e => e.key === "Enter" && (authTab === "login" ? handleLogin() : doSignup())} />
+
+                  {/* Password strength meter — signup only */}
+                  {authTab === "signup" && authForm.password.length > 0 && (() => {
+                    const { score, passed, label, color } = getPasswordStrength(authForm.password);
+                    return (
+                      <div style={{ marginTop: 8 }}>
+                        <div style={{ display: "flex", gap: 4, marginBottom: 6 }}>
+                          {[0,1,2,3,4].map(i => (
+                            <div key={i} style={{
+                              flex: 1, height: 3, borderRadius: 2,
+                              background: i < score ? color : "rgba(255,255,255,0.08)",
+                              transition: "background 0.2s",
+                            }} />
+                          ))}
+                          <span style={{ fontSize: 11, color, marginLeft: 6, fontWeight: 600, whiteSpace: "nowrap", lineHeight: "3px", alignSelf: "center" }}>{label}</span>
+                        </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                          {PW_RULES.map((rule, i) => (
+                            <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11 }}>
+                              <span style={{ color: passed[i] ? "#00c076" : "rgba(238,238,242,0.28)", fontSize: 10, flexShrink: 0 }}>
+                                {passed[i] ? "✓" : "○"}
+                              </span>
+                              <span style={{ color: passed[i] ? "rgba(238,238,242,0.6)" : "rgba(238,238,242,0.35)" }}>
+                                {rule.label}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+
+                {signupError && authTab === "signup" && (
+                  <div style={{ fontSize: 12, color: "#ff3b5c", padding: "7px 10px", background: "rgba(255,59,92,0.08)", borderRadius: 7, border: "1px solid rgba(255,59,92,0.2)" }}>
+                    {signupError}
                   </div>
                 )}
 
-                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  {authTab === "signup" && (
-                    <>
-                      <input placeholder="Full name" value={authForm.name}
-                        onChange={e => setAuthForm(p => ({ ...p, name: e.target.value }))} />
-                      <select value={authForm.role} onChange={e => setAuthForm(p => ({ ...p, role: e.target.value }))}>
-                        <option value="student">Student</option>
-                        <option value="teacher">Teacher</option>
-                      </select>
-                      {authForm.role === "student" && (
-                        <input placeholder="Class access code"
-                          value={authForm.classCode}
-                          onChange={e => setAuthForm(p => ({ ...p, classCode: e.target.value }))}
-                          style={{ fontFamily: "'IBM Plex Mono',monospace", letterSpacing: "0.12em", textTransform: "uppercase" }} />
-                      )}
-                    </>
-                  )}
-                  <input type="email" placeholder="Email address" value={authForm.email}
-                    onChange={e => { setAuthForm(p => ({ ...p, email: e.target.value })); setSessionConflict(null); }} />
-                  <div>
-                    <input type="password" placeholder="Password" value={authForm.password}
-                      onChange={e => { setAuthForm(p => ({ ...p, password: e.target.value })); setSessionConflict(null); setVerifyError(""); }}
-                      onKeyDown={e => e.key === "Enter" && (authTab === "login" ? handleLogin() : initiateSignup())} />
-
-                    {/* Password strength meter — signup only */}
-                    {authTab === "signup" && authForm.password.length > 0 && (() => {
-                      const { score, passed, label, color } = getPasswordStrength(authForm.password);
-                      return (
-                        <div style={{ marginTop: 8 }}>
-                          {/* Bar */}
-                          <div style={{ display: "flex", gap: 4, marginBottom: 6 }}>
-                            {[0,1,2,3,4].map(i => (
-                              <div key={i} style={{
-                                flex: 1, height: 3, borderRadius: 2,
-                                background: i < score ? color : "rgba(255,255,255,0.08)",
-                                transition: "background 0.2s",
-                              }} />
-                            ))}
-                            <span style={{ fontSize: 11, color, marginLeft: 6, fontWeight: 600, whiteSpace: "nowrap", lineHeight: "3px", alignSelf: "center" }}>{label}</span>
-                          </div>
-                          {/* Requirements checklist */}
-                          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                            {PW_RULES.map((rule, i) => (
-                              <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11 }}>
-                                <span style={{ color: passed[i] ? "#00c076" : "rgba(238,238,242,0.28)", fontSize: 10, flexShrink: 0 }}>
-                                  {passed[i] ? "✓" : "○"}
-                                </span>
-                                <span style={{ color: passed[i] ? "rgba(238,238,242,0.6)" : "rgba(238,238,242,0.35)" }}>
-                                  {rule.label}
-                                </span>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      );
-                    })()}
-                  </div>
-
-                  {verifyError && authTab === "signup" && (
-                    <div style={{ fontSize: 12, color: "#ff3b5c", padding: "7px 10px", background: "rgba(255,59,92,0.08)", borderRadius: 7, border: "1px solid rgba(255,59,92,0.2)" }}>
-                      {verifyError}
-                    </div>
-                  )}
-
-                  <button
-                    onClick={authTab === "login" ? () => handleLogin() : initiateSignup}
-                    disabled={sendLoading}
-                    style={{ ...btnStyle("green"), opacity: sendLoading ? 0.7 : 1, cursor: sendLoading ? "default" : "pointer" }}
-                    onMouseEnter={e => e.currentTarget.style.opacity = sendLoading ? "0.7" : "0.9"}
-                    onMouseLeave={e => e.currentTarget.style.opacity = sendLoading ? "0.7" : "1"}
-                    onMouseDown={e => e.currentTarget.style.transform = "scale(0.98)"}
-                    onMouseUp={e => e.currentTarget.style.transform = "scale(1)"}
-                  >
-                    {authTab === "login" ? "Sign in" : (sendLoading ? "Sending code…" : "Continue")}
-                  </button>
-                </div>
-              </>
-            )}
+                <button
+                  onClick={authTab === "login" ? () => handleLogin() : doSignup}
+                  disabled={signupLoading}
+                  style={{ ...btnStyle("green"), opacity: signupLoading ? 0.7 : 1, cursor: signupLoading ? "default" : "pointer" }}
+                  onMouseEnter={e => e.currentTarget.style.opacity = signupLoading ? "0.7" : "0.9"}
+                  onMouseLeave={e => e.currentTarget.style.opacity = signupLoading ? "0.7" : "1"}
+                  onMouseDown={e => e.currentTarget.style.transform = "scale(0.98)"}
+                  onMouseUp={e => e.currentTarget.style.transform = "scale(1)"}
+                >
+                  {authTab === "login" ? "Sign in" : (signupLoading ? "Creating account…" : "Create account")}
+                </button>
+              </div>
+            </>
 
             {authTab === "login" && (
               <>
